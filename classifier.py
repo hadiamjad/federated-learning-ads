@@ -1,21 +1,15 @@
 import numpy as np
 import pandas as pd
 import json
-from tqdm import tqdm
 from collections import defaultdict
-from surprise import Dataset
-from surprise import Reader
-from surprise import KNNBasic
-from surprise import SVD
-from surprise import accuracy
-from surprise.model_selection import cross_validate
-from libreco.data import random_split, DatasetPure
-from libreco.algorithms import LightGCN  # pure data, algorithm LightGCN
-from libreco.evaluation import evaluate
+from surprise import Dataset, Reader, KNNBasic, SVD
+from surprise.model_selection import cross_validate, train_test_split
+from sklearn.metrics import precision_score, recall_score
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
 from tensorflow.keras.layers import Input, Embedding, Flatten, Dot, Dense, Concatenate
 from tensorflow.keras.models import Model
+
 
 # read the dictionary from the JSON file
 with open('my_dict.json', 'r') as file:
@@ -74,25 +68,6 @@ def createtSupriseData(matrix):
 
     return df
 
-def createTwoDMatrix(data_dict):
-    # Get the list of unique user IDs and category IDs
-    user_ids = list(data_dict.keys())
-    category_ids = set()
-    for user_id in user_ids:
-        category_ids.update(data_dict[user_id].keys())
-    category_ids = list(category_ids)
-
-    # Create a two-dimensional numpy array with zeros
-    user_item_matrix = np.zeros((len(user_ids), len(category_ids)))
-
-    # Fill in the non-zero elements in the numpy array
-    for i, user_id in enumerate(user_ids):
-        for j, category_id in enumerate(category_ids):
-            if category_id in data_dict[user_id]:
-                user_item_matrix[i, j] = data_dict[user_id][category_id]
-
-    return user_item_matrix
-
 def KnnModel(df):
     print(df.shape)
     # A reader is still needed but only the rating_scale param is requiered.
@@ -109,6 +84,37 @@ def KnnModel(df):
     print(pred)
     # Print the mean RMSE across all folds
     print("Mean MAE:", results['test_mae'].mean())
+
+def KnnModelPrecisionRecall(df):
+    print(df.shape)
+    # A reader is still needed but only the rating_scale param is requiered.
+    reader = Reader(rating_scale=(1, 2))
+
+    # The columns must correspond to user id, item id and ratings (in that order).
+    data = Dataset.load_from_df(df[["user_id", "item_id", "rating"]], reader)
+
+    # Split the data into training and testing sets
+    trainset, testset = train_test_split(data, test_size=0.2)
+
+    # Define the algorithm and run cross-validation
+    algo = KNNBasic()
+    # Train the algorithm on the training set
+    algo.fit(trainset)
+
+    # Test the algorithm on the testing set
+    predictions = algo.test(testset)
+
+    # Convert the predictions to binary labels using the threshold of 1.5
+    true_labels = [1 if true_rating <= 1.5 else 2 for (_, _, true_rating) in testset]
+    predicted_labels = [1 if pred_rating[3] <= 1.5 else 2 for pred_rating in predictions]
+
+
+    # Compute precision and recall scores
+    precision = precision_score(true_labels, predicted_labels)
+    recall = recall_score(true_labels, predicted_labels)
+
+    print("Precision:", precision)
+    print("Recall:", recall)
    
 def SVDModel(df):
     # A reader is still needed but only the rating_scale param is requiered.
@@ -119,13 +125,44 @@ def SVDModel(df):
 
     # Define the algorithm and run cross-validation
     algo = SVD()
-    results = cross_validate(algo, data, measures=['MAE'], cv=5, verbose=True)
+    results = cross_validate(algo, data, measures=['mae'], cv=5, verbose=True)
 
     algo.fit(data.build_full_trainset())
     pred = algo.test([(26, "Water", 1)])
     print(pred)
     # Print the mean RMSE across all folds
     print("Mean MAE:", results['test_mae'].mean())
+
+def SVDModelPrecisionRecall(df):
+    # A reader is still needed but only the rating_scale param is requiered.
+    reader = Reader(rating_scale=(1, 2))
+
+    # The columns must correspond to user id, item id and ratings (in that order).
+    data = Dataset.load_from_df(df[["user_id", "item_id", "rating"]], reader)
+
+    # Split the data into training and testing sets
+    trainset, testset = train_test_split(data, test_size=0.2)
+
+    # Define the algorithm and run cross-validation
+    algo = SVD()
+
+    # Train the algorithm on the training set
+    algo.fit(trainset)
+
+    # Test the algorithm on the testing set
+    predictions = algo.test(testset)
+
+    # Convert the predictions to binary labels using the threshold of 1.5
+    true_labels = [1 if true_rating <= 1.5 else 2 for (_, _, true_rating) in testset]
+    predicted_labels = [1 if pred_rating[3] <= 1.5 else 2 for pred_rating in predictions]
+
+
+    # Compute precision and recall scores
+    precision = precision_score(true_labels, predicted_labels)
+    recall = recall_score(true_labels, predicted_labels)
+
+    print("Precision:", precision)
+    print("Recall:", recall)
 
 def torchModel(df):
     # Preprocess the data
@@ -205,66 +242,106 @@ def torchModel(df):
     rating_pred = model.predict(x=[[user_code], [item_code]])[0][0]
     print(f"Predicted rating for user {user_id} and item {item_id}: {rating_pred:.2f}")
 
-def librecoModel(df):
-    data = df.rename(columns={'user_id': 'user', 'item_id': 'item', 'rating': 'label'})
-    print(data.head(5))
+def torchModelPrecisionRecall(df):
+    # Preprocess the data
+    df["user_id"] = df["user_id"].astype("category")
+    df["item_id"] = df["item_id"].astype("category")
 
-    # split whole data into three folds for training, evaluating and testing
-    train_data, eval_data, test_data = random_split(data, multi_ratios=[0.8, 0.1, 0.1])
+    # Define the number of users and items
+    num_users = len(df["user_id"].cat.categories)
+    num_items = len(df["item_id"].cat.categories)
+    print("Number of users:", num_users)
+    print("Number of items:", num_items)
 
-    train_data, data_info = DatasetPure.build_trainset(train_data)
-    eval_data = DatasetPure.build_evalset(eval_data)
-    test_data = DatasetPure.build_testset(test_data)
+    # Define the deep learning model
+    def build_model():
+        user_input = Input(shape=(1,))
+        user_embedding = Embedding(num_users, 10)(user_input)
+        user_flatten = Flatten()(user_embedding)
 
-    # sample negative items for each record
-    train_data.build_negative_samples(data_info)
-    eval_data.build_negative_samples(data_info)
-    test_data.build_negative_samples(data_info)
-    print(data_info)  # n_users: 5894, n_items: 3253, data sparsity: 0.4172 %
+        item_input = Input(shape=(1,))
+        item_embedding = Embedding(num_items, 10)(item_input)
+        item_flatten = Flatten()(item_embedding)
 
-    lightgcn = LightGCN(
-        task="ranking",
-        data_info=data_info,
-        loss_type="bpr",
-        embed_size=16,
-        n_epochs=2,
-        lr=1e-3,
-        batch_size=100,
-        num_neg=1,
-        device="cuda",
-    )
-    # monitor metrics on eval data during training
-    lightgcn.fit(
-        train_data,
-        verbose=2,
-        eval_data=eval_data,
-        metrics=["loss", "roc_auc", "precision", "recall", "ndcg"],
-    )
+        dot_product = Dot(axes=1)([user_flatten, item_flatten])
+        output = Dense(1)(dot_product)
 
-    # do final evaluation on test data
-    evaluate(
-        model=lightgcn,
-        data=test_data,
-        eval_batch_size=8192,
-        k=10,
-        metrics=["loss", "roc_auc", "precision", "recall", "ndcg"],
-    )
+        model = Model(inputs=[user_input, item_input], outputs=output)
+        model.compile(loss="mean_squared_error", optimizer="adam")
+        
+        return model
 
-    # predict preference of user 2211 to item 110
-    print(lightgcn.predict(user=24, item="Finger"))
-    # # recommend 7 items for user 2211
-    # print(lightgcn.recommend_user(user=24, n_rec=7))
+    # Define the number of folds for cross-validation
+    num_folds = 5
 
-    # # cold-start prediction
-    # lightgcn.predict(user="ccc", item="not item", cold_start="average")
-    # # cold-start recommendation
-    # lightgcn.recommend_user(user="are we good?", n_rec=7, cold_start="popular")
+    # Split the data into folds and iterate over them
+    kf = KFold(n_splits=num_folds, shuffle=True)
+    mae_scores = []
+    precision_scores = []
+    recall_scores = []
+
+    for fold, (train_indices, val_indices) in enumerate(kf.split(df)):
+        print(f"Fold {fold + 1}...")
+
+        # Split the data into training and validation sets
+        train_df = df.iloc[train_indices]
+        val_df = df.iloc[val_indices]
+
+        # Build the model
+        model = build_model()
+
+        # Train the model
+        model.fit(
+            x=[train_df["user_id"].cat.codes.values, train_df["item_id"].cat.codes.values],
+            y=train_df["rating"].values,
+            batch_size=64,
+            epochs=10,
+            verbose=0
+        )
+
+        # Evaluate the model on the validation set
+        val_preds = model.predict(
+            x=[val_df["user_id"].cat.codes.values, val_df["item_id"].cat.codes.values],
+            batch_size=64
+        )
+        mae_score = mean_absolute_error(val_df["rating"], val_preds)
+        mae_scores.append(mae_score)
+        print(f"MAE: {mae_score:.4f}")
+
+        # Compute precision and recall
+        binary_val_preds = [1 if pred <= 1.5 else 2 for pred in val_preds]
+        precision_score_val = precision_score(val_df["rating"], binary_val_preds, pos_label=1)
+        recall_score_val = recall_score(val_df["rating"], binary_val_preds, pos_label=1)
+        precision_scores.append(precision_score_val)
+        recall_scores.append(recall_score_val)
+        print(f"Precision: {precision_score_val:.4f}, Recall: {recall_score_val:.4f}")
+
+    # Calculate the mean and standard deviation of the MAE, precision, and recall scores
+    mean_mae = np.mean(mae_scores)
+    std_mae = np.std(mae_scores)
+    mean_precision = np.mean(precision_scores)
+    std_precision = np.std(precision_scores)
+    mean_recall = np.mean(recall_scores)
+    std_recall = np.std(recall_scores)
+    print(mean_precision)
+    print(mean_recall)
+
+def venn(df):
+    # Create a list of sets
+    sets = [
+        set(df[df["rating"] == 1]["item_id"]),
+        set(df[df["rating"] == 2]["item_id"]),
+    ]
+
+    # Using the & operator
+    intersection_set = sets[0] & sets[1]
+    print(len(sets[1]-intersection_set))
 
 
 def main():
     matrix = createGoogleVisionMatrix()
     df = createtSupriseData(matrix)
-
-    torchModel(df)
+    print(df.head(5))
+    torchModelPrecisionRecall(df)
  
 main()
